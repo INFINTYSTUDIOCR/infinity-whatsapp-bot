@@ -75,6 +75,66 @@ function cacheTTS(key, buffer){
   ttsCache.set(key, buffer);
 }
 
+const ELEVEN_KEY = process.env.ELEVENLABS_KEY;
+const ALICE_VOICE_ID = process.env.ALICE_VOICE_ID || 'r1KmysJdVYZjJCm4mL3b';
+const JILL_VOICE_ID = process.env.JILL_VOICE_ID || 'NoOVOzCQFLOvtsMoNcdT';
+const CLAIRE_VOICE_ID = process.env.CLAIRE_VOICE_ID || 'FGLJyeekUzxl8M3CTG9M';
+
+function cleanTtsText(text) {
+  return (text || '')
+    .replace(/ALICE:|CLAIRE:|JILL:/gi, '')
+    .replace(/[*_#\[\]{}<>|~`^]/g, ' ')
+    .replace(/\.{2,}/g, '.')
+    .replace(/!+/g, '.')
+    .replace(/,/g, ' ')
+    .replace(/;/g, ' ')
+    .replace(/:/g, ' ')
+    .replace(/<br>/gi, ' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[ ]{2,}/g, ' ')
+    .trim()
+    .slice(0, 600);
+}
+
+async function synthesizeSpeech(req, res, { text, voiceId, label }) {
+  if (!text) return res.status(400).json({ error: 'Missing text' });
+  if (!ELEVEN_KEY) return res.status(500).json({ error: 'ELEVENLABS_KEY not configured' });
+  if (!voiceId) return res.status(503).json({ error: `${label} voice ID not configured` });
+
+  const clean = cleanTtsText(text);
+  if (!clean) return res.status(400).json({ error: 'Empty text' });
+
+  const cacheKey = getTTSCacheKey(clean, voiceId);
+  if (ttsCache.has(cacheKey)) {
+    const cached = ttsCache.get(cacheKey);
+    res.set('Content-Type', 'audio/mpeg');
+    res.set('X-Cache', 'HIT');
+    return res.send(cached);
+  }
+
+  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+    method: 'POST',
+    headers: { 'xi-api-key': ELEVEN_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+    body: JSON.stringify({
+      text: clean,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true }
+    })
+  });
+
+  if (!r.ok) {
+    const err = await r.text();
+    console.error(`${label} TTS error:`, err);
+    return res.status(500).json({ error: 'TTS failed' });
+  }
+
+  const buf = Buffer.from(await r.arrayBuffer());
+  cacheTTS(cacheKey, buf);
+  res.set('Content-Type', 'audio/mpeg');
+  res.set('Cache-Control', 'no-cache');
+  return res.send(buf);
+}
+
 
 app.post('/alice', async (req, res) => {
   try {
@@ -90,16 +150,9 @@ app.post('/alice', async (req, res) => {
       const tb = (student?.trainingBook || []).slice(0,4)
         .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
 
-      let nexoraContext = '';
-      if (nexora?.type) {
-        const types = { mock_interview:'mock job interview', customer_service:'customer service scenario', team_meeting:'team meeting', problem_solving:'crisis/problem solving', presentation:'executive presentation', negotiation:'negotiation', stakeholder:'stakeholder discussion' };
-        const inds = { corporate:'corporate/business', tech:'technology', healthcare:'healthcare', education:'education', finance:'finance/banking', hospitality:'hospitality/tourism', retail:'retail/sales' };
-        nexoraContext = `\n\nNEXORA ACTIVE: You are roleplaying a ${types[nexora.type]||nexora.type} in the ${inds[nexora.industry]||nexora.industry} industry, difficulty ${nexora.difficulty}/5. Take on the role immediately — be the interviewer, client, or colleague. Start the scenario now.`;
-      }
-
       const resp = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001', max_tokens: 250,
-        messages: [{ role: 'user', content: `You are Alice (your name is ALICE, not Alaiz, not Alicia — always ALICE). You are a warm and encouraging English tutor using the Nexus Method. Greet ${student?.name||'the student'} warmly by name (2-3 sentences max). Tell them you'll practice English together and ask ONE engaging open question to start.${nexoraContext}\n\nStudent level: ${student?.level||'Functional'}. Their exercises:\n${tb||'(none yet)'}\n\nEnd with: ALICE: [one motivating tip in Spanish]` }]
+        messages: [{ role: 'user', content: `You are Alice (your name is ALICE, not Alaiz, not Alicia — always ALICE). You are a warm and encouraging English tutor using the Nexus Method. Greet ${student?.name||'the student'} warmly by name (2-3 sentences max). Tell them you'll practice English together and ask ONE engaging open question to start. You are a tutor only — never roleplay as a customer, interviewer, or Nexora simulator.\n\nStudent level: ${student?.level||'Functional'}. Their exercises:\n${tb||'(none yet)'}\n\nEnd with: ALICE: [one motivating tip in Spanish]` }]
       });
       return res.json({ opening: resp.content.filter(b=>b.type==='text').map(b=>b.text).join('') });
     }
@@ -141,13 +194,9 @@ app.post('/alice', async (req, res) => {
     const tb = (student?.trainingBook||[]).slice(0,5)
       .map(ex=>`- ${ex.title} (${ex.kpi||''}): ${ex.studentTask||''}`).join('\n');
 
-    let nexoraInstructions = '';
-    if (nexora?.type) {
-      const types = { mock_interview:'mock job interview', customer_service:'customer service', team_meeting:'team meeting', problem_solving:'crisis simulation', presentation:'presentation', negotiation:'negotiation', stakeholder:'stakeholder discussion' };
-      nexoraInstructions = `\n\nNEXORA MODE: You are roleplaying a ${types[nexora.type]||nexora.type} in ${nexora.industry||'corporate'} industry (difficulty ${nexora.difficulty||3}/5). Stay in character. After their response, give brief in-character reply then coaching tip.`;
-    }
-
     const systemPrompt = `You are Alice, a warm, patient, and encouraging English tutor. You love helping people and you never rush.
+
+ROLE: You are a tutor and coach only. You NEVER roleplay as a customer, client, interviewer, manager, or any Nexora character. If the student asks you to simulate a scenario, explain warmly that simulations happen in Alice Mode through Nexora, and redirect to practice.
 
 PERSONALITY: Warm, human, celebratory, patient. You speak like a real person — not a textbook. You use natural expressions, tell short examples, and explain things clearly. Never robotic. Never cut yourself off mid-sentence.
 
@@ -165,7 +214,7 @@ RESPONSE STYLE:
 - Ask ONE follow-up question at the end
 
 STUDENT: ${student?.name||'Student'} | Level: ${student?.level||'Functional'}
-EXERCISES:\n${tb||'(none yet)'}${nexoraInstructions}`;
+EXERCISES:\n${tb||'(none yet)'}`;
 
     const msgs = history?.length
       ? [...history.slice(-10), { role:'user', content:message }]
@@ -180,6 +229,105 @@ EXERCISES:\n${tb||'(none yet)'}${nexoraInstructions}`;
   } catch(err) {
     console.error('Alice error:', err.message);
     return res.status(500).json({ error: 'Alice no está disponible ahora.' });
+  }
+});
+
+// ── JILL — Tutora Foundations ────────────────────────────────
+const JILL_SYSTEM_PROMPT = `Sos Jill, la tutora de Foundations de Studio Infinity CR.
+
+IDENTIDAD:
+Tu nombre es Jill. Sos paciente, cálida, amorosa y nunca generás presión. El estudiante que llega a vos ya intentó antes y falló — no por falta de esfuerzo sino porque ningún sistema anterior atacó el problema correcto. Tu trabajo empieza por reconstruir su confianza mientras simultáneamente construís las rutas neurales que le faltan.
+
+Nunca juzgás. Nunca mostrás impaciencia. Celebrás cada avance, por pequeño que sea. Corregís siempre con afecto y claridad, nunca con frustración.
+
+IDIOMA:
+Hablás en español durante explicaciones, teoría, análisis y correcciones.
+Practicás en inglés durante los ejercicios orales y de producción.
+Cuando das un ejemplo en inglés, lo contextualizás en español primero.
+
+FILOSOFÍA CENTRAL — Idea + Linker + Idea:
+No enseñás inglés — enseñás a conectar ideas ya existentes usando andamiaje preestablecido.
+El estudiante no construye cada frase desde cero. Ejecuta la fórmula y la llena con contenido.
+Linkers clave: however, on top of that, even though, therefore, besides, so far, in other words, rather than, as long as, as a result, not only... but also, in addition to that, at the same time.
+
+MÉTODO — CHUNKING:
+El cerebro no procesa palabras individuales — procesa bloques.
+Un hablante fluido no piensa I + want + to + say, piensa "I want to say" como una unidad.
+Entrenás al estudiante a construir y almacenar chunks operacionales listos para usar.
+
+PRESIÓN CERO:
+Nunca presionás. El ambiente de Jill es práctica segura.
+Equivocarse es parte del proceso y nunca tiene costo emocional.
+
+LOS 8 KPIs QUE EVALUÁS:
+1. Linkers y Connectors — ¿usa conectores naturalmente, mínimo 3 por respuesta?
+2. Prefijos y Sufijos — ¿construye palabras usando modificadores (un-, re-, -tion, -ly)?
+3. Tiempo Verbal y Transición — ¿se mueve entre tiempos fluidamente?
+4. Estructura Oral — Apertura + Desarrollo + Cierre
+5. Word Choice — ¿usa palabras precisas o siempre la más básica?
+6. Entonación y Ritmo — ¿suena natural o telegráfico?
+7. Expresiones y Frases Base — ¿usa chunks preestablecidos?
+8. Recuperabilidad — ¿se detiene cuando comete un error o usa técnicas de recovery?
+
+ROL EN ESTE SISTEMA:
+Vos sos el Modo Jill. Mientras vos estás activa, el sistema está en modo aprendizaje.
+NO simulás escenarios de trabajo, entrevistas, clientes ni llamadas.
+NO evaluás para certificación ni ORT.
+SÍ explicás, analizás, ejemplificás, guiás, enseñás y practicás con el estudiante.
+Si el estudiante pregunta por simulaciones: le explicás que eso es Alice Mode y que su trainer lo activará cuando esté listo.
+
+CONTENIDO ADAPTABLE:
+Cuando querés mostrar algo visual o estructurado, usás el campo contentType en tu respuesta para señalarlo.
+- "text" — respuesta conversacional normal
+- "exercise" — ejercicio estructurado que el estudiante debe hacer
+- "example" — demostración de una técnica con ejemplo concreto
+- "whiteboard" — explicación estructurada como si fuera un pizarrón (listas, pasos, tabla)
+
+RESPUESTA:
+Respondé siempre en JSON válido con este formato:
+{"reply":"tu respuesta aquí","contentType":"text|exercise|example|whiteboard"}
+No uses markdown. No uses texto fuera del JSON.`;
+
+app.post('/jill', async (req, res) => {
+  try {
+    const { student, history, message, mode } = req.body || {};
+
+    const name = student?.name || 'estudiante';
+    const level = student?.level || 'Foundations';
+    const exercises = (student?.trainingBook || []).slice(0, 4)
+      .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
+
+    if (mode === 'start_session') {
+      const resp = await anthropic.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 300,
+        system: JILL_SYSTEM_PROMPT,
+        messages: [{
+          role: 'user',
+          content: `El estudiante ${name} (nivel: ${level}) acaba de abrir su sesión. Saludalo con calidez, recordale en qué estaban trabajando si hay ejercicios asignados, y hacé UNA pregunta simple para arrancar. Ejercicios asignados:\n${exercises || '(ninguno aún)'}\n\nResponde en JSON: {"reply":"...","contentType":"text"}`
+        }]
+      });
+      const raw = resp.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      try { return res.json(JSON.parse(raw)); } catch { return res.json({ reply: raw, contentType: 'text' }); }
+    }
+
+    const msgs = (history || []).slice(-12).concat([{ role: 'user', content: message }]);
+    const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}`;
+
+    const resp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 500,
+      system: systemWithContext,
+      messages: msgs
+    });
+
+    const raw = resp.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    try { return res.json(JSON.parse(raw)); }
+    catch { return res.json({ reply: raw, contentType: 'text' }); }
+
+  } catch (err) {
+    console.error('Jill error:', err.message);
+    return res.status(500).json({ error: 'Jill no está disponible ahora.' });
   }
 });
 
@@ -279,114 +427,29 @@ COMPRENSIÓN: Leé bien lo que dice el cliente antes de responder. Respondé a L
 app.post('/claire-tts', async (req, res) => {
   try {
     const { text } = req.body || {};
-    if(!text) return res.status(400).json({ error: 'Missing text' });
-
-    const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
-    // Valentina — voz femenina latinoamericana de ElevenLabs
-    const VOICE_ID = 'FGLJyeekUzxl8M3CTG9M'; // Claire voice; // Voz seleccionada
-
-    // Limpiar texto
-    const clean = text
-      .replace(/ALICE:|CLAIRE:/g, '')
-      .replace(/[*_#<>\[\]{}|~`^]/g, ' ')
-      .replace(/\.{2,}/g, '.')
-      .replace(/!+/g, '.')
-      .replace(/,/g, ' ')
-      .replace(/;/g, ' ')
-      .replace(/<br>/g, ' ')
-      .replace(/<[^>]*>/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 600);
-
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVEN_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg'
-      },
-      body: JSON.stringify({
-        text: clean,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true }
-      })
-    });
-
-    if(!r.ok){
-      const err = await r.text();
-      console.error('ElevenLabs error:', err);
-      return res.status(500).json({ error: 'TTS failed' });
-    }
-
-    const audioBuffer = await r.arrayBuffer();
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Cache-Control', 'no-cache');
-    res.send(Buffer.from(audioBuffer));
-
-  } catch(err) {
-    console.error('TTS error:', err.message);
+    return await synthesizeSpeech(req, res, { text, voiceId: CLAIRE_VOICE_ID, label: 'Claire' });
+  } catch (err) {
+    console.error('Claire TTS error:', err.message);
     return res.status(500).json({ error: 'TTS unavailable' });
   }
 });
 
-// ── ALICE TTS ────────────────────────────────────────────────
 app.post('/alice-tts', async (req, res) => {
   try {
     const { text } = req.body || {};
-    if(!text) return res.status(400).json({ error: 'Missing text' });
-
-    const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
-    const VOICE_ID = 'r1KmysJdVYZjJCm4mL3b';
-    
-    // Check cache first
-    const cacheKey = getTTSCacheKey(text, VOICE_ID);
-    if(ttsCache.has(cacheKey)){
-      const cached = ttsCache.get(cacheKey);
-      res.set('Content-Type', 'audio/mpeg');
-      res.set('X-Cache', 'HIT');
-      return res.send(cached);
-    } // Voz seleccionada
-
-    const clean = text
-      .replace(/ALICE:/gi, '').replace(/CLAIRE:/gi, '')
-      .replace(/[*_#\[\]{}<>|~`^]/g, ' ')
-      .replace(/,/g, ' ')
-      .replace(/;/g, ' ')
-      .replace(/:/g, ' ')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/[ ]{2,}/g, ' ')
-      .trim().slice(0, 600);
-
-    if(!clean) return res.status(400).json({ error: 'Empty text' });
-
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
-      method: 'POST',
-      headers: {
-        'xi-api-key': ELEVEN_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'audio/mpeg'
-      },
-      body: JSON.stringify({
-        text: clean,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true }
-      })
-    });
-
-    if(!r.ok){
-      const err = await r.text();
-      console.error('Alice TTS error:', err);
-      return res.status(500).json({ error: 'TTS failed' });
-    }
-
-    const audioBuffer = await r.arrayBuffer();
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Cache-Control', 'no-cache');
-    res.send(Buffer.from(audioBuffer));
-
-  } catch(err) {
+    return await synthesizeSpeech(req, res, { text, voiceId: ALICE_VOICE_ID, label: 'Alice' });
+  } catch (err) {
     console.error('Alice TTS error:', err.message);
+    return res.status(500).json({ error: 'TTS unavailable' });
+  }
+});
+
+app.post('/jill-tts', async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    return await synthesizeSpeech(req, res, { text, voiceId: JILL_VOICE_ID, label: 'Jill' });
+  } catch (err) {
+    console.error('Jill TTS error:', err.message);
     return res.status(500).json({ error: 'TTS unavailable' });
   }
 });
@@ -508,48 +571,12 @@ app.get('/dashboard', async (req, res) => {
 app.post('/nexora-tts', async (req, res) => {
   try {
     const { text, voiceId } = req.body || {};
-    if(!text) return res.status(400).json({ error: 'Missing text' });
-
-    const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
-    // Use provided voiceId or fall back to default Alice voice
-    const VOICE_ID = voiceId || 'r1KmysJdVYZjJCm4mL3b';
-
-    // Check cache
-    const nxCacheKey = getTTSCacheKey(text, VOICE_ID);
-    if(ttsCache.has(nxCacheKey)){
-      const cached = ttsCache.get(nxCacheKey);
-      res.set('Content-Type', 'audio/mpeg');
-      res.set('X-Cache', 'HIT');
-      return res.send(cached);
-    }
-
-    const clean = text
-      .replace(/ALICE:/gi, '').replace(/CLAIRE:/gi, '')
-      .replace(/[*_#\[\]{}<>|~`^]/g, ' ')
-      .replace(/,/g, ' ').replace(/;/g, ' ').replace(/:/g, ' ')
-      .replace(/<[^>]*>/g, ' ').replace(/[ ]{2,}/g, ' ')
-      .trim().slice(0, 600);
-
-    if(!clean) return res.status(400).json({ error: 'Empty text' });
-
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVEN_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-      body: JSON.stringify({
-        text: clean,
-        model_id: 'eleven_multilingual_v2',
-        voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true }
-      })
+    return await synthesizeSpeech(req, res, {
+      text,
+      voiceId: voiceId || ALICE_VOICE_ID,
+      label: 'Nexora'
     });
-
-    if(!r.ok){ const err = await r.text(); console.error('Nexora TTS error:', err); return res.status(500).json({ error: 'TTS failed' }); }
-    const buf = await r.arrayBuffer();
-    const nxBuffer = Buffer.from(buf);
-    cacheTTS(nxCacheKey, nxBuffer);
-    res.set('Content-Type', 'audio/mpeg');
-    res.set('Cache-Control', 'no-cache');
-    res.send(nxBuffer);
-  } catch(err) {
+  } catch (err) {
     console.error('Nexora TTS error:', err.message);
     return res.status(500).json({ error: 'TTS unavailable' });
   }
