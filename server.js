@@ -10,7 +10,25 @@ app.use(cors());
 const { ANTHROPIC_API_KEY, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, VERIFY_TOKEN,
         SUPABASE_URL, SUPABASE_KEY, ANALYZE_SECRET, PORT = 3000 } = process.env;
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY, timeout: 25000 });
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
+// Raw fetch wrapper — bypasses SDK bug with Render's Node environment
+async function claudeCall({ model, max_tokens, system, messages }) {
+  const body = { model: model || 'claude-haiku-4-5-20251001', max_tokens: max_tokens || 500, messages };
+  if (system) body.system = system;
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data?.error?.message || `HTTP ${r.status}`);
+  return data;
+}
 
 async function sbGet(table) {
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,data`, {
@@ -172,7 +190,7 @@ app.post('/alice', async (req, res) => {
       const tb = (student?.trainingBook || []).slice(0,4)
         .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
 
-      const resp = await anthropic.messages.create({
+      const resp = await claudeCall({
         model: 'claude-haiku-4-5-20251001', max_tokens: 250,
         messages: [{ role: 'user', content: `You are Alice (your name is ALICE, not Alaiz, not Alicia — always ALICE). You are a warm and encouraging English tutor using the Nexus Method. Greet ${student?.name||'the student'} warmly by name (2-3 sentences max). Tell them you'll practice English together and ask ONE engaging open question to start. You are a tutor only — never roleplay as a customer, interviewer, or Nexora simulator.\n\nStudent level: ${student?.level||'Functional'}. Their exercises:\n${tb||'(none yet)'}\n\nEnd with: ALICE: [one motivating tip in Spanish]` }]
       });
@@ -192,7 +210,7 @@ app.post('/alice', async (req, res) => {
         }});
       }
 
-      const resp = await anthropic.messages.create({
+      const resp = await claudeCall({
         model: 'claude-haiku-4-5-20251001', max_tokens: 400,
         system: 'You are Alice, a warm English tutor. Respond ONLY with valid JSON. No markdown. No extra text.',
         messages: [{ role: 'user', content: `Evaluate this English practice session for ${student?.name||'the student'} (level: ${student?.level||'Functional'}).\n\nSession:\n${hist}\n\nReturn ONLY this JSON:\n{"overall_score":75,"best_moment":"One specific warm thing they did well","main_improvement":"One concrete tip in simple English","alice_message":"2-3 warm encouraging sentences to the student. End with: ALICE: [one motivating sentence in Spanish]"}` }]
@@ -242,7 +260,7 @@ EXERCISES:\n${tb||'(none yet)'}`;
       ? [...history.slice(-10), { role:'user', content:message }]
       : [{ role:'user', content:message }];
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-haiku-4-5-20251001', max_tokens: 700,
       system: systemPrompt, messages: msgs
     });
@@ -336,7 +354,7 @@ app.post('/jill', async (req, res) => {
       .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
 
     if (mode === 'start_session') {
-      const resp = await anthropic.messages.create({
+      const resp = await claudeCall({
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 350,
         system: JILL_SYSTEM_PROMPT,
@@ -355,7 +373,7 @@ app.post('/jill', async (req, res) => {
     const msgs = [...prevMsgs, { role: 'user', content: message }];
     const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con JSON: {"reply":"...","contentType":"text|exercise|example|whiteboard"} — sin texto fuera del JSON.`;
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 600,
       system: systemWithContext,
@@ -412,7 +430,7 @@ app.post('/claire', async (req, res) => {
 
     // START
     if (mode === 'start') {
-      const resp = await anthropic.messages.create({
+      const resp = await claudeCall({
         model: 'claude-haiku-4-5-20251001', max_tokens: 150,
         system: `Eres Claire, la asistente virtual de Off The Clock by Infinity. Eres cálida, paciente, inteligente y apasionada por ayudar a las personas a comunicarse mejor en inglés. Sabés exactamente qué dolor siente cada persona que llega.
 
@@ -451,7 +469,7 @@ COMPRENSIÓN: Leé bien lo que dice el cliente antes de responder. Respondé a L
       ? [...history.slice(-12), { role:'user', content:message }]
       : [{ role:'user', content:message }];
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-sonnet-4-6', max_tokens: 150,
       system: systemPrompt, messages: msgs
     });
@@ -813,7 +831,7 @@ CRITICAL RULES:
       ? [...history.slice(-14), { role: 'user', content: message }]
       : [{ role: 'user', content: message }];
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-sonnet-4-6',
       max_tokens: 150,
       system: systemPrompt,
@@ -860,7 +878,7 @@ Respond ONLY with valid JSON, no markdown:
   "practice_minutes": ${Math.ceil((talkTime || 60) / 60)}
 }`;
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-sonnet-4-6',
       max_tokens: 600,
       system: 'You evaluate customer service call simulations. Respond ONLY with valid JSON. No markdown. No extra text.',
@@ -884,7 +902,7 @@ app.post('/analyze', async (req, res) => {
     const { prompt, secret } = req.body || {};
     if (ANALYZE_SECRET && secret !== ANALYZE_SECRET) return res.status(401).json({ error: 'Unauthorized' });
     if (!prompt) return res.status(400).json({ error: 'Missing prompt' });
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-haiku-4-5-20251001', max_tokens: 1000,
       messages: [{ role:'user', content:prompt }]
     });
@@ -916,7 +934,7 @@ app.post('/webhook', async (req, res) => {
     conv.history.push({ role:'user', content:text });
     if (conv.history.length > 20) conv.history = conv.history.slice(-20);
 
-    const resp = await anthropic.messages.create({
+    const resp = await claudeCall({
       model: 'claude-haiku-4-5-20251001', max_tokens: 300,
       system: `Eres Claire, asistente de Off The Clock by Infinity en WhatsApp. Cálida, breve, directa. Mensajes cortos — máximo 3 líneas. Si hay interés real en el programa, pedí nombre y horario preferido para la evaluación gratuita. WhatsApp: +506 6006 0981`,
       messages: conv.history.slice(-10)
