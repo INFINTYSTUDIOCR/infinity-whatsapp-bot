@@ -1,7 +1,7 @@
 {
   "name": "alice-by-infinity",
   "version": "1.0.0",
-  "description": "Alice \u2014 AI English Tutor & WhatsApp Bot \u2014 Studio Infinity CR",
+  "description": "Alice, Jill, Claire, Nexora — Studio Infinity CR",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,7 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "@anthropic-ai/sdk": "^0.32.1",
+    "@anthropic-ai/sdk": "^0.39.0",
     "dotenv": "^16.4.5"
   },
   "engines": {
