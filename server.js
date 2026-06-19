@@ -75,7 +75,7 @@ function cacheTTS(key, buffer){
   ttsCache.set(key, buffer);
 }
 
-const ELEVEN_KEY = process.env.ELEVENLABS_KEY;
+const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
 const ALICE_VOICE_ID = process.env.ALICE_VOICE_ID || 'r1KmysJdVYZjJCm4mL3b';
 const JILL_VOICE_ID = process.env.JILL_VOICE_ID || 'NoOVOzCQFLOvtsMoNcdT';
 const CLAIRE_VOICE_ID = process.env.CLAIRE_VOICE_ID || 'FGLJyeekUzxl8M3CTG9M';
@@ -485,7 +485,7 @@ app.get('/dashboard', async (req, res) => {
     // 1. ElevenLabs credits
     let elevenCredits = null;
     try {
-      const ELEVEN_KEY = process.env.ELEVENLABS_KEY;
+      const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
       const eRes = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
         headers: { 'xi-api-key': ELEVEN_KEY }
       });
