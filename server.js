@@ -10,7 +10,7 @@ app.use(cors());
 const { ANTHROPIC_API_KEY, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, VERIFY_TOKEN,
         SUPABASE_URL, SUPABASE_KEY, ANALYZE_SECRET, PORT = 3000 } = process.env;
 
-const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY, timeout: 25000 });
 
 async function sbGet(table) {
   const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,data`, {
@@ -32,6 +32,21 @@ async function sbSet(table, id, data) {
 
 // ── HEALTHCHECK ──────────────────────────────────────────────
 app.get('/', (req, res) => res.send('Alice & Claire by Studio Infinity CR — OK'));
+
+// ── KEY DIAGNOSTIC (temp) ────────────────────────────────────
+app.get('/keycheck', async (req, res) => {
+  const k = process.env.ANTHROPIC_API_KEY || '';
+  const preview = k ? k.slice(0,12)+'...'+k.slice(-4) : '(NOT SET)';
+  try {
+    const test = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 10,
+      messages: [{ role: 'user', content: 'Say OK' }]
+    });
+    return res.json({ key: preview, status: 'WORKS', reply: test.content[0]?.text });
+  } catch(e) {
+    return res.json({ key: preview, status: 'FAIL', error: e.message });
+  }
+});
 
 // ── RATE LIMIT ───────────────────────────────────────────────
 const ALICE_LIMIT = 50;
