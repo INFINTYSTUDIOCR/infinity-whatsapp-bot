@@ -227,8 +227,8 @@ EXERCISES:\n${tb||'(none yet)'}`;
     return res.json({ reply: resp.content.filter(b=>b.type==='text').map(b=>b.text).join('') });
 
   } catch(err) {
-    console.error('Alice error:', err.message);
-    return res.status(500).json({ error: 'Alice no está disponible ahora.' });
+    console.error('Alice error:', err.message, err.status);
+    return res.status(500).json({ error: 'Alice no está disponible ahora.', detail: err.message });
   }
 });
 
@@ -344,8 +344,8 @@ app.post('/jill', async (req, res) => {
     return res.json(parseJillResponse(raw));
 
   } catch (err) {
-    console.error('Jill error:', err.message);
-    return res.status(500).json({ error: 'Jill no está disponible ahora.' });
+    console.error('Jill error:', err.message, err.status);
+    return res.status(500).json({ error: 'Jill no está disponible ahora.', detail: err.message });
   }
 });
 
