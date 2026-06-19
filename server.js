@@ -392,6 +392,101 @@ app.post('/jill', async (req, res) => {
   }
 });
 
+// ── STREAMING HELPER ─────────────────────────────────────────
+async function streamAnthropicSSE(res, { model, max_tokens, system, messages }) {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Allow-Origin': '*'
+  });
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({ model: model || 'claude-haiku-4-5-20251001', max_tokens: max_tokens || 400, stream: true, system, messages })
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    res.write(`data: ${JSON.stringify({ error: err?.error?.message || 'API error' })}\n\n`);
+    return res.end();
+  }
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (!raw) continue;
+      try {
+        const evt = JSON.parse(raw);
+        if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta' && evt.delta.text) {
+          res.write(`data: ${JSON.stringify({ t: evt.delta.text })}\n\n`);
+        } else if (evt.type === 'message_stop') {
+          res.write('data: [DONE]\n\n');
+        }
+      } catch {}
+    }
+  }
+  res.end();
+}
+
+// ── JILL STREAM ──────────────────────────────────────────────
+app.post('/jill/stream', async (req, res) => {
+  try {
+    const { student, history, message, weakKpis } = req.body || {};
+    if (!message) return res.status(400).end();
+    const name = student?.name || 'estudiante';
+    const level = student?.level || 'Foundations';
+    const exercises = (student?.trainingBook || []).slice(0, 4)
+      .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
+    const weakNote = weakKpis?.length ? `\nTemas a reforzar hoy: ${weakKpis.join(', ')}.` : '';
+    const msgs = [...(history || []).slice(-10), { role: 'user', content: message }];
+    await streamAnthropicSSE(res, {
+      max_tokens: 400,
+      system: JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS:\n${exercises || '(ninguno)'}${weakNote}\n\nResponde en texto directo, sin JSON, como en una conversación oral. Máx 4-5 oraciones. Completa siempre tu última oración.`,
+      messages: msgs
+    });
+  } catch (err) {
+    console.error('Jill stream error:', err.message);
+    if (!res.headersSent) res.status(500).end(); else res.end();
+  }
+});
+
+// ── ALICE STREAM ─────────────────────────────────────────────
+app.post('/alice/stream', async (req, res) => {
+  try {
+    const { student, history, message, scenario, secret } = req.body || {};
+    if (ANALYZE_SECRET && secret !== ANALYZE_SECRET) return res.status(401).end();
+    if (!message) return res.status(400).end();
+    const tb = (student?.trainingBook || []).slice(0, 5)
+      .map(ex => `- ${ex.title} (${ex.kpi || ''}): ${ex.studentTask || ''}`).join('\n');
+    const sceneNote = scenario ? `\nActive scenario: ${scenario.title || ''} — ${scenario.desc || ''}` : '';
+    const system = `You are Alice, a warm, patient, and encouraging English tutor using the Nexus Method.
+ROLE: Tutor only. NEVER roleplay as customer/interviewer/Nexora character.
+PERSONALITY: Warm, human, celebratory, patient. Speak like a real person.
+METHOD — NEXUS: Idea + Linker + Idea. Connectors: however, on top of that, even though, therefore, besides, so far, in other words.
+RESPONSE STYLE: 3-4 natural sentences max. Complete every sentence. Ask ONE follow-up question. End with: ALICE: [one tip in Spanish].
+STUDENT: ${student?.name || 'Student'} | Level: ${student?.level || 'Functional'}
+EXERCISES:\n${tb || '(none yet)'}${sceneNote}`;
+    const msgs = [...(history || []).slice(-10), { role: 'user', content: message }];
+    await streamAnthropicSSE(res, { max_tokens: 350, system, messages: msgs });
+  } catch (err) {
+    console.error('Alice stream error:', err.message);
+    if (!res.headersSent) res.status(500).end(); else res.end();
+  }
+});
+
 // ── CLAIRE — Agente comercial ─────────────────────────────────
 const CLAIRE_KB = `
 QUIÉNES SOMOS:
