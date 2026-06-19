@@ -37,14 +37,21 @@ app.get('/', (req, res) => res.send('Alice & Claire by Studio Infinity CR — OK
 app.get('/keycheck', async (req, res) => {
   const k = process.env.ANTHROPIC_API_KEY || '';
   const preview = k ? k.slice(0,12)+'...'+k.slice(-4) : '(NOT SET)';
+  // Test via raw fetch (bypasses SDK)
   try {
-    const test = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001', max_tokens: 10,
-      messages: [{ role: 'user', content: 'Say OK' }]
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': k,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ model:'claude-haiku-4-5-20251001', max_tokens:10, messages:[{role:'user',content:'Say OK'}] })
     });
-    return res.json({ key: preview, status: 'WORKS', reply: test.content[0]?.text });
+    const data = await r.json();
+    return res.json({ key: preview, status: r.ok ? 'WORKS' : 'API_ERROR', httpStatus: r.status, data });
   } catch(e) {
-    return res.json({ key: preview, status: 'FAIL', error: e.message });
+    return res.json({ key: preview, status: 'NETWORK_FAIL', error: e.message });
   }
 });
 
