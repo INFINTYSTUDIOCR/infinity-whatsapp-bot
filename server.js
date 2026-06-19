@@ -288,6 +288,22 @@ Respondé siempre en JSON válido con este formato:
 {"reply":"tu respuesta aquí","contentType":"text|exercise|example|whiteboard"}
 No uses markdown. No uses texto fuera del JSON.`;
 
+// Extracts {reply, contentType} from Claude response regardless of markdown wrapping
+function parseJillResponse(raw) {
+  try {
+    const clean = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+    const parsed = JSON.parse(clean);
+    if (parsed.reply) return parsed;
+  } catch {}
+  // Try to find JSON object anywhere in the string
+  const match = raw.match(/\{[\s\S]*?"reply"\s*:\s*"([\s\S]*?)"[\s\S]*?\}/);
+  if (match) {
+    try { return JSON.parse(match[0]); } catch {}
+  }
+  // Fallback: use raw text as reply
+  return { reply: raw.replace(/```[\s\S]*?```/g, '').trim(), contentType: 'text' };
+}
+
 app.post('/jill', async (req, res) => {
   try {
     const { student, history, message, mode } = req.body || {};
@@ -300,30 +316,32 @@ app.post('/jill', async (req, res) => {
     if (mode === 'start_session') {
       const resp = await anthropic.messages.create({
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 300,
+        max_tokens: 350,
         system: JILL_SYSTEM_PROMPT,
         messages: [{
           role: 'user',
-          content: `El estudiante ${name} (nivel: ${level}) acaba de abrir su sesión. Saludalo con calidez, recordale en qué estaban trabajando si hay ejercicios asignados, y hacé UNA pregunta simple para arrancar. Ejercicios asignados:\n${exercises || '(ninguno aún)'}\n\nResponde en JSON: {"reply":"...","contentType":"text"}`
+          content: `El estudiante ${name} (nivel: ${level}) acaba de abrir su sesión. Saludalo con calidez, recordale en qué estaban trabajando si hay ejercicios asignados, y hacé UNA pregunta simple para arrancar. Ejercicios asignados:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con este JSON exacto, sin nada más antes ni después:\n{"reply":"tu saludo aquí","contentType":"text"}`
         }]
       });
       const raw = resp.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-      try { return res.json(JSON.parse(raw)); } catch { return res.json({ reply: raw, contentType: 'text' }); }
+      return res.json(parseJillResponse(raw));
     }
 
-    const msgs = (history || []).slice(-12).concat([{ role: 'user', content: message }]);
-    const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}`;
+    if (!message) return res.status(400).json({ error: 'Missing message' });
+
+    const prevMsgs = (history || []).slice(-12);
+    const msgs = [...prevMsgs, { role: 'user', content: message }];
+    const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con JSON: {"reply":"...","contentType":"text|exercise|example|whiteboard"} — sin texto fuera del JSON.`;
 
     const resp = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 500,
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 600,
       system: systemWithContext,
       messages: msgs
     });
 
     const raw = resp.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-    try { return res.json(JSON.parse(raw)); }
-    catch { return res.json({ reply: raw, contentType: 'text' }); }
+    return res.json(parseJillResponse(raw));
 
   } catch (err) {
     console.error('Jill error:', err.message);
