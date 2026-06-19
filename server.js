@@ -346,12 +346,15 @@ function parseJillResponse(raw) {
 
 app.post('/jill', async (req, res) => {
   try {
-    const { student, history, message, mode } = req.body || {};
+    const { student, history, message, mode, weakKpis } = req.body || {};
 
     const name = student?.name || 'estudiante';
     const level = student?.level || 'Foundations';
     const exercises = (student?.trainingBook || []).slice(0, 4)
       .map(ex => `- ${ex.title}: ${ex.studentTask || ''}`).join('\n');
+    const weakNote = (weakKpis && weakKpis.length)
+      ? `\nÁREAS DÉBILES EN QUIZ (reforzar hoy): ${weakKpis.join(', ')}.`
+      : '';
 
     if (mode === 'start_session') {
       const resp = await claudeCall({
@@ -360,7 +363,7 @@ app.post('/jill', async (req, res) => {
         system: JILL_SYSTEM_PROMPT,
         messages: [{
           role: 'user',
-          content: `El estudiante ${name} (nivel: ${level}) acaba de abrir su sesión. Saludalo con calidez, recordale en qué estaban trabajando si hay ejercicios asignados, y hacé UNA pregunta simple para arrancar. Ejercicios asignados:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con este JSON exacto, sin nada más antes ni después:\n{"reply":"tu saludo aquí","contentType":"text"}`
+          content: `El estudiante ${name} (nivel: ${level}) acaba de abrir su sesión. Saludalo con calidez, recordale en qué estaban trabajando si hay ejercicios asignados, y hacé UNA pregunta simple para arrancar.${weakNote}\nEjercicios asignados:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con este JSON exacto, sin nada más antes ni después:\n{"reply":"tu saludo aquí","contentType":"text"}`
         }]
       });
       const raw = resp.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
@@ -371,7 +374,7 @@ app.post('/jill', async (req, res) => {
 
     const prevMsgs = (history || []).slice(-12);
     const msgs = [...prevMsgs, { role: 'user', content: message }];
-    const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}\n\nRESPONDE ÚNICAMENTE con JSON: {"reply":"...","contentType":"text|exercise|example|whiteboard"} — sin texto fuera del JSON.`;
+    const systemWithContext = JILL_SYSTEM_PROMPT + `\n\nESTUDIANTE: ${name} | Nivel: ${level}\nEJERCICIOS ASIGNADOS:\n${exercises || '(ninguno aún)'}${weakNote}\n\nRESPONDE ÚNICAMENTE con JSON: {"reply":"...","contentType":"text|exercise|example|whiteboard"} — sin texto fuera del JSON.`;
 
     const resp = await claudeCall({
       model: 'claude-haiku-4-5-20251001',
