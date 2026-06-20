@@ -1,11 +1,47 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const Anthropic = require('@anthropic-ai/sdk');
+const { signToken, verifyToken, requireAuth, optionalAuth, JWT_EXPIRY_SEC, JWT_SECRET } = require('./auth');
 
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb' }));
-app.use(cors());
+
+// ── SECURITY HEADERS ─────────────────────────────────────────
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'microphone=(self), camera=()');
+  next();
+});
+
+// ── CORS (allowed origins only) ──────────────────────────────
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
+  'https://infintystudiocr.github.io,https://studioinfinitycr.com,https://www.studioinfinitycr.com,http://localhost:8765,http://127.0.0.1:5500,http://localhost:5500'
+).split(',').map(s => s.trim()).filter(Boolean);
+
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o.replace(/\/$/, '')))) {
+      return callback(null, true);
+    }
+    console.warn('CORS blocked:', origin);
+    return callback(new Error('CORS not allowed'));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400
+}));
+
+if (!JWT_SECRET) {
+  console.warn('⚠ JWT_SECRET not set — set JWT_SECRET or ANALYZE_SECRET in Render env for production auth.');
+}
 
 const { ANTHROPIC_API_KEY, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, VERIFY_TOKEN,
         SUPABASE_URL, SUPABASE_KEY, ANALYZE_SECRET, PORT = 3000 } = process.env;
@@ -96,6 +132,549 @@ async function checkLimit(sid, table) {
   } catch(e) { return { ok: true }; }
 }
 
+// ── LOGIN RATE LIMIT (brute force) ───────────────────────────
+const loginRateMap = new Map();
+const LOGIN_MAX_ATTEMPTS = 15;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  let entry = loginRateMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+  }
+  entry.count++;
+  loginRateMap.set(ip, entry);
+  if (entry.count > LOGIN_MAX_ATTEMPTS) {
+    return { ok: false, waitMin: Math.max(1, Math.ceil((entry.resetAt - now) / 60000)) };
+  }
+  return { ok: true };
+}
+
+const AUTH_ROLES = ['student', 'trainer', 'superadmin', 'master'];
+const requireProductAuth = requireAuth(['student', 'trainer', 'superadmin', 'master']);
+
+function assertStudentScope(req, studentId) {
+  if (req.auth.role === 'student' && studentId && studentId !== req.auth.studentId) {
+    return false;
+  }
+  return true;
+}
+
+// ── AUTH ─────────────────────────────────────────────────────
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { user, password, role } = req.body || {};
+    const ip = getClientIp(req);
+    const rl = checkLoginRateLimit(ip);
+    if (!rl.ok) {
+      return res.status(429).json({ error: 'Too many login attempts', waitMin: rl.waitMin });
+    }
+    if (!user || !password || !role) {
+      return res.status(400).json({ error: 'Missing credentials' });
+    }
+    if (!JWT_SECRET) {
+      return res.status(503).json({ error: 'Auth not configured on server' });
+    }
+
+    const loginUser = String(user).trim().toLowerCase();
+
+    if (role === 'student') {
+      const rows = await sbGet('infinity_students');
+      const match = rows.find(r =>
+        r.data &&
+        String(r.data.portalUser || '').trim().toLowerCase() === loginUser &&
+        r.data.portalPass === password
+      );
+      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      if (match.data.status === 'suspended') {
+        return res.status(403).json({ error: 'Account suspended' });
+      }
+      const token = signToken({
+        sub: match.id,
+        role: 'student',
+        studentId: match.id,
+        name: match.data.info?.name || loginUser
+      });
+      return res.json({
+        token,
+        expiresIn: JWT_EXPIRY_SEC,
+        role: 'student',
+        studentId: match.id,
+        name: match.data.info?.name || loginUser
+      });
+    }
+
+    if (role === 'trainer') {
+      const masterEmail = (process.env.MASTER_TRAINER_EMAIL || 'trainer@infinity.cr').toLowerCase();
+      const masterPass = process.env.MASTER_TRAINER_PASS || process.env.ANALYZE_SECRET;
+      if (masterPass && loginUser === masterEmail && password === masterPass) {
+        const token = signToken({
+          sub: 'USR-MASTER',
+          role: 'superadmin',
+          name: process.env.MASTER_TRAINER_NAME || 'Master Trainer',
+          email: masterEmail
+        });
+        return res.json({
+          token,
+          expiresIn: JWT_EXPIRY_SEC,
+          role: 'superadmin',
+          name: process.env.MASTER_TRAINER_NAME || 'Master Trainer'
+        });
+      }
+      const rows = await sbGet('infinity_users');
+      const match = rows.find(r =>
+        r.data &&
+        String(r.data.email || '').trim().toLowerCase() === loginUser &&
+        r.data.pass === password
+      );
+      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      if (match.data.status === 'suspended') {
+        return res.status(403).json({ error: 'Account suspended' });
+      }
+      const trainerRole = match.data.role || 'trainer';
+      const token = signToken({
+        sub: match.id,
+        role: trainerRole,
+        name: match.data.name,
+        email: match.data.email,
+        department: match.data.department
+      });
+      return res.json({
+        token,
+        expiresIn: JWT_EXPIRY_SEC,
+        role: trainerRole,
+        name: match.data.name
+      });
+    }
+
+    return res.status(400).json({ error: 'Invalid role' });
+  } catch (err) {
+    console.error('Login error:', err.message);
+    return res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+app.get('/auth/verify', requireProductAuth, (req, res) => {
+  res.json({
+    ok: true,
+    role: req.auth.role,
+    sub: req.auth.sub,
+    name: req.auth.name,
+    studentId: req.auth.studentId || null
+  });
+});
+
+// ── DEMO: IP LIMITS + RESPONSE BUFFER ────────────────────────
+const DEMO_LIMITS = {
+  alice:  { sessionsPerDay: 5, maxSteps: 4 },
+  nexora: { sessionsPerDay: 5, maxSteps: 3 },
+  claire: { sessionsPerDay: 8, messagesPerDay: 30 },
+  tts:    { sessionsPerDay: 999, messagesPerDay: 40, ttsPerDay: 40 }
+};
+const IP_DAY_MS = 24 * 60 * 60 * 1000;
+const demoResponseCache = new Map();
+const DEMO_CACHE_MAX = 300;
+
+let DEMO_BUFFER = {};
+try {
+  const bufCandidates = [
+    path.join(__dirname, '../config/demo-buffer.json'),
+    path.join(__dirname, 'config/demo-buffer.json')
+  ];
+  for (const bufPath of bufCandidates) {
+    if (fs.existsSync(bufPath)) {
+      DEMO_BUFFER = JSON.parse(fs.readFileSync(bufPath, 'utf8'));
+      console.log('demo-buffer loaded:', bufPath);
+      break;
+    }
+  }
+  if (!Object.keys(DEMO_BUFFER).length) console.warn('demo-buffer.json not found in config paths');
+} catch (e) {
+  console.warn('demo-buffer.json not loaded:', e.message);
+}
+
+const ELEVEN_KEY = process.env.ELEVENLABS_KEY || '';
+const ALICE_VOICE_ID = process.env.ALICE_VOICE_ID || 'r1KmysJdVYZjJCm4mL3b';
+const JILL_VOICE_ID = process.env.JILL_VOICE_ID || 'NoOVOzCQFLOvtsMoNcdT';
+const CLAIRE_VOICE_ID = process.env.CLAIRE_VOICE_ID || 'FGLJyeekUzxl8M3CTG9M';
+
+function loadVoicesConfig() {
+  const candidates = [
+    path.join(__dirname, '../config/voices.json'),
+    path.join(__dirname, 'config/voices.json')
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch (e) { /* next path */ }
+  }
+  return {};
+}
+
+function getDemoVoiceProfiles() {
+  const cfg = loadVoicesConfig();
+  const nd = cfg.nexora_demo || {};
+  const starFromEnv = (process.env.NEXORA_DEMO_MALE_VOICE_ID || '').trim();
+  const csFromEnv = (process.env.NEXORA_DEMO_FEMALE_VOICE_ID || '').trim();
+  const starFromFile = (nd.star_interviewer?.voiceId || '').trim();
+  const csFromFile = (nd.cs_client?.voiceId || JILL_VOICE_ID).trim();
+  const starId = starFromEnv || starFromFile || ALICE_VOICE_ID;
+  const csId = csFromEnv || csFromFile;
+  return {
+    alice: {
+      voiceId: ALICE_VOICE_ID,
+      label: cfg.alice?.label || 'Alice',
+      gender: 'female',
+      source: 'elevenlabs-account'
+    },
+    nexora_star: {
+      voiceId: starId,
+      label: nd.star_interviewer?.label || 'Interviewer',
+      gender: 'male',
+      source: starFromEnv ? 'NEXORA_DEMO_MALE_VOICE_ID' : (starFromFile ? 'voices.json' : 'alice-fallback'),
+      needsMaleVoice: !starFromEnv && !starFromFile
+    },
+    nexora_cs: {
+      voiceId: csId,
+      label: nd.cs_client?.label || 'Maria Santos',
+      gender: 'female',
+      source: csFromEnv ? 'NEXORA_DEMO_FEMALE_VOICE_ID' : 'jill-voices.json'
+    }
+  };
+}
+
+function getDemoTtsAllowlist() {
+  const p = getDemoVoiceProfiles();
+  const cfg = loadVoicesConfig();
+  const nd = cfg.nexora_demo || {};
+  return new Set([
+    ALICE_VOICE_ID, JILL_VOICE_ID, CLAIRE_VOICE_ID,
+    p.nexora_star.voiceId, p.nexora_cs.voiceId,
+    nd.star_interviewer?.voiceId,
+    nd.cs_client?.voiceId
+  ].filter(Boolean));
+}
+
+function getDemoVoiceProfileFor(service, scenario) {
+  const profiles = getDemoVoiceProfiles();
+  if (service === 'alice') return profiles.alice;
+  if (service === 'nexora') {
+    return scenario === 'customer_service' ? profiles.nexora_cs : profiles.nexora_star;
+  }
+  return profiles.alice;
+}
+
+function getClientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+function ipStorageKey(ip) {
+  return 'DEMO-IP-' + crypto.createHash('sha256').update(ip).digest('hex').slice(0, 24);
+}
+
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function getIpRecord(ip) {
+  const id = ipStorageKey(ip);
+  try {
+    const rows = await sbGet('infinity_sessions');
+    const row = rows.find(r => r.id === id);
+    return { id, data: row?.data || {} };
+  } catch (e) {
+    return { id, data: {} };
+  }
+}
+
+async function saveIpRecord(id, data) {
+  try { await sbSet('infinity_sessions', id, data); } catch (e) {}
+}
+
+async function checkDemoIpLimit(ip, service, { action } = {}) {
+  if (!ip || ip === 'unknown') return { ok: true, sessionsLeft: DEMO_LIMITS[service]?.sessionsPerDay || 5 };
+  const limits = DEMO_LIMITS[service];
+  if (!limits) return { ok: true };
+
+  const { id, data } = await getIpRecord(ip);
+  const day = todayKey();
+  const bucket = data[service] || { day, sessions: 0, messages: 0 };
+  if (bucket.day !== day) { bucket.day = day; bucket.sessions = 0; bucket.messages = 0; bucket.tts = 0; }
+
+  if (action === 'session') {
+    if (bucket.sessions >= limits.sessionsPerDay) {
+      return { ok: false, reason: 'sessions', wait: '24 horas', sessionsLeft: 0 };
+    }
+    bucket.sessions++;
+  }
+
+  if (action === 'message') {
+    bucket.messages = (bucket.messages || 0) + 1;
+    if (limits.messagesPerDay && bucket.messages > limits.messagesPerDay) {
+      data[service] = bucket;
+      await saveIpRecord(id, data);
+      return { ok: false, reason: 'messages', wait: '24 horas', sessionsLeft: 0 };
+    }
+  }
+
+  if (action === 'tts') {
+    bucket.tts = (bucket.tts || 0) + 1;
+    const ttsCap = limits.ttsPerDay || limits.messagesPerDay || 40;
+    if (bucket.tts > ttsCap) {
+      data[service] = bucket;
+      await saveIpRecord(id, data);
+      return { ok: false, reason: 'tts', wait: '24 horas', sessionsLeft: 0 };
+    }
+  }
+
+  data[service] = bucket;
+  await saveIpRecord(id, data);
+  return {
+    ok: true,
+    sessionsLeft: Math.max(0, limits.sessionsPerDay - bucket.sessions),
+    messagesLeft: limits.messagesPerDay ? Math.max(0, limits.messagesPerDay - bucket.messages) : null
+  };
+}
+
+function bufferKey(service, scenario, step) {
+  return service + ':' + (scenario || 'default') + ':' + step;
+}
+
+function cacheDemoResponse(key, reply) {
+  if (demoResponseCache.size >= DEMO_CACHE_MAX) {
+    demoResponseCache.delete(demoResponseCache.keys().next().value);
+  }
+  demoResponseCache.set(key, reply);
+}
+
+function getDemoBuffer(service, scenario) {
+  if (service === 'alice') return DEMO_BUFFER.alice;
+  if (service === 'nexora') {
+    return scenario === 'customer_service' ? DEMO_BUFFER.nexora_cs : DEMO_BUFFER.nexora_star;
+  }
+  return null;
+}
+
+function detectConnectors(text) {
+  const list = ['however', 'on top of that', 'even though', 'therefore', 'besides', 'so far', 'in other words', 'despite', 'as a result', 'in addition'];
+  const lower = (text || '').toLowerCase();
+  return list.filter(c => lower.includes(c));
+}
+
+function enrichEvaluation(baseEval, history) {
+  const userText = (history || []).filter(m => m.role === 'user').map(m => m.content).join(' ');
+  const found = detectConnectors(userText);
+  const ev = JSON.parse(JSON.stringify(baseEval));
+  if (found.length && ev.connectors_found !== undefined) ev.connectors_found = found;
+  if (found.length && ev.connectors_suggested) {
+    ev.connectors_suggested = ev.connectors_suggested.filter(c => !found.includes(c));
+  }
+  if (found.length >= 2 && ev.overall_score) ev.overall_score = Math.min(95, ev.overall_score + 10);
+  else if (found.length === 1 && ev.overall_score) ev.overall_score = Math.min(90, ev.overall_score + 5);
+  return ev;
+}
+
+async function saveDemoKb({ service, scenario, history, evaluation, consent, ip }) {
+  if (!consent) return;
+  const day = todayKey();
+  const kbId = 'DEMO-KB-' + day;
+  try {
+    const rows = await sbGet('infinity_sessions');
+    const existing = rows.find(r => r.id === kbId);
+    const data = existing?.data || { sessions: [] };
+    data.sessions.push({
+      service, scenario,
+      turns: (history || []).length,
+      evaluation,
+      connectors: detectConnectors((history || []).filter(m => m.role === 'user').map(m => m.content).join(' ')),
+      ts: new Date().toISOString(),
+      ipHash: ipStorageKey(ip || 'unknown')
+    });
+    if (data.sessions.length > 500) data.sessions = data.sessions.slice(-500);
+    await sbSet('infinity_sessions', kbId, data);
+  } catch (e) {
+    console.error('Demo KB save failed:', e.message);
+  }
+}
+
+async function getDemoSession(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const rows = await sbGet('infinity_sessions');
+    const row = rows.find(r => r.id === 'DEMO-SESSION-' + sessionId);
+    return row?.data || null;
+  } catch (e) { return null; }
+}
+
+async function saveDemoSession(sessionId, data) {
+  try {
+    await sbSet('infinity_sessions', 'DEMO-SESSION-' + sessionId, data);
+  } catch (e) {}
+}
+
+app.post('/demo/start', async (req, res) => {
+  try {
+    const { service, scenario, consent, name } = req.body || {};
+    if (!consent) return res.status(400).json({ error: 'Consent required' });
+    if (!['alice', 'nexora'].includes(service)) return res.status(400).json({ error: 'Invalid service' });
+
+    const ip = getClientIp(req);
+    const ipLimit = await checkDemoIpLimit(ip, service, { action: 'session' });
+    if (!ipLimit.ok) {
+      return res.status(429).json({
+        error: 'limit',
+        message: `Demo limit reached for today. Try again in ${ipLimit.wait}.`,
+        wait: ipLimit.wait
+      });
+    }
+
+    const buf = getDemoBuffer(service, scenario);
+    if (!buf) return res.status(500).json({ error: 'Demo buffer unavailable' });
+
+    const sessionId = crypto.randomUUID();
+    const reply = buf.start.replace(/\*\*/g, '');
+    const session = {
+      service,
+      scenario: scenario || (service === 'nexora' ? 'star' : 'default'),
+      step: 0,
+      name: name || 'Guest',
+      consent: true,
+      ip,
+      history: [{ role: 'assistant', content: reply }],
+      createdAt: new Date().toISOString(),
+      apiCalls: 0
+    };
+    await saveDemoSession(sessionId, session);
+
+    return res.json({
+      sessionId,
+      reply,
+      step: 0,
+      maxSteps: service === 'alice' ? DEMO_LIMITS.alice.maxSteps : DEMO_LIMITS.nexora.maxSteps,
+      buffered: true,
+      sessionsLeft: ipLimit.sessionsLeft,
+      voiceProfile: getDemoVoiceProfileFor(service, scenario || (service === 'nexora' ? 'star' : 'default'))
+    });
+  } catch (err) {
+    console.error('Demo start error:', err.message);
+    return res.status(500).json({ error: 'Demo unavailable' });
+  }
+});
+
+app.post('/demo/message', async (req, res) => {
+  try {
+    const { sessionId, message } = req.body || {};
+    if (!sessionId || !message?.trim()) return res.status(400).json({ error: 'Missing sessionId or message' });
+
+    const session = await getDemoSession(sessionId);
+    if (!session) return res.status(404).json({ error: 'Session expired. Start a new demo.' });
+
+    const ip = getClientIp(req);
+    const ipLimit = await checkDemoIpLimit(ip, session.service, { action: 'message' });
+    if (!ipLimit.ok) {
+      return res.status(429).json({ error: 'limit', message: 'Daily demo message limit reached.', wait: ipLimit.wait });
+    }
+
+    const buf = getDemoBuffer(session.service, session.scenario);
+    const maxSteps = session.service === 'alice' ? DEMO_LIMITS.alice.maxSteps : DEMO_LIMITS.nexora.maxSteps;
+
+    session.history.push({ role: 'user', content: message.trim() });
+    session.step++;
+
+    const cacheK = bufferKey(session.service, session.scenario, session.step);
+    if (demoResponseCache.has(cacheK)) {
+      const cached = demoResponseCache.get(cacheK);
+      session.history.push({ role: 'assistant', content: cached });
+      await saveDemoSession(sessionId, session);
+      return res.json({ reply: cached, step: session.step, done: session.step >= maxSteps, buffered: true, cacheHit: true });
+    }
+
+    let reply;
+    let done = session.step >= maxSteps;
+
+    if (done) {
+      reply = buf.finish.reply;
+    } else {
+      reply = (buf.steps[session.step - 1] || buf.steps[buf.steps.length - 1]).replace(/\*\*/g, '');
+    }
+
+    cacheDemoResponse(cacheK, reply);
+    session.history.push({ role: 'assistant', content: reply });
+    await saveDemoSession(sessionId, session);
+
+    const payload = { reply, step: session.step, done, buffered: true, maxSteps };
+    if (done) {
+      payload.evaluation = enrichEvaluation(buf.finish.evaluation, session.history);
+      await saveDemoKb({
+        service: session.service,
+        scenario: session.scenario,
+        history: session.history,
+        evaluation: payload.evaluation,
+        consent: session.consent,
+        ip
+      });
+    }
+
+    return res.json(payload);
+  } catch (err) {
+    console.error('Demo message error:', err.message);
+    return res.status(500).json({ error: 'Demo unavailable' });
+  }
+});
+
+app.get('/demo/status', async (req, res) => {
+  try {
+    const ip = getClientIp(req);
+    const service = req.query.service || 'alice';
+    const { data } = await getIpRecord(ip);
+    const day = todayKey();
+    const bucket = data[service] || { day, sessions: 0, messages: 0 };
+    const limits = DEMO_LIMITS[service] || DEMO_LIMITS.alice;
+    const sessionsUsed = bucket.day === day ? bucket.sessions : 0;
+    return res.json({
+      service,
+      sessionsUsed,
+      sessionsLeft: Math.max(0, limits.sessionsPerDay - sessionsUsed),
+      maxSteps: limits.maxSteps || 4
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Status unavailable' });
+  }
+});
+
+app.get('/demo/voices', (req, res) => {
+  try {
+    return res.json(getDemoVoiceProfiles());
+  } catch (err) {
+    return res.status(500).json({ error: 'Voices unavailable' });
+  }
+});
+
+app.post('/demo/tts', async (req, res) => {
+  try {
+    const { text, voiceId: bodyVoiceId } = req.body || {};
+    const ip = getClientIp(req);
+    const ipLimit = await checkDemoIpLimit(ip, 'tts', { action: 'tts' });
+    if (!ipLimit.ok) {
+      return res.status(429).json({ error: 'limit', message: 'Demo voice limit reached for today.' });
+    }
+
+    const allowlist = getDemoTtsAllowlist();
+    if (!bodyVoiceId || !allowlist.has(bodyVoiceId)) {
+      return res.status(400).json({ error: 'Voice not allowed for demo. Use voiceId from GET /demo/voices (your ElevenLabs account only).' });
+    }
+
+    const label = bodyVoiceId === ALICE_VOICE_ID ? 'Alice demo' : 'Nexora demo';
+    return await synthesizeSpeech(req, res, { text, voiceId: bodyVoiceId, label });
+  } catch (err) {
+    console.error('Demo TTS error:', err.message);
+    return res.status(500).json({ error: 'TTS unavailable' });
+  }
+});
+
 // ── ALICE — Tutora de práctica ────────────────────────────────
 
 // ── TTS CACHE (en memoria) ─────────────────────────────────────
@@ -114,11 +693,6 @@ function cacheTTS(key, buffer){
   }
   ttsCache.set(key, buffer);
 }
-
-const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
-const ALICE_VOICE_ID = process.env.ALICE_VOICE_ID || 'r1KmysJdVYZjJCm4mL3b';
-const JILL_VOICE_ID = process.env.JILL_VOICE_ID || 'NoOVOzCQFLOvtsMoNcdT';
-const CLAIRE_VOICE_ID = process.env.CLAIRE_VOICE_ID || 'FGLJyeekUzxl8M3CTG9M';
 
 function cleanTtsText(text) {
   return (text || '')
@@ -176,10 +750,12 @@ async function synthesizeSpeech(req, res, { text, voiceId, label }) {
 }
 
 
-app.post('/alice', async (req, res) => {
+app.post('/alice', requireProductAuth, async (req, res) => {
   try {
     const { student, history, message, mode, secret, nexora } = req.body || {};
-    if (ANALYZE_SECRET && secret !== ANALYZE_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+    if (req.auth.role === 'student' && !assertStudentScope(req, student?.id)) {
+      return res.status(403).json({ error: 'Student scope mismatch' });
+    }
 
     const isKamuk = student?.id && student.id.startsWith('KAM-');
     const tutorName = 'Alice';
@@ -344,7 +920,7 @@ function parseJillResponse(raw) {
   return { reply: raw.replace(/```[\s\S]*?```/g, '').trim(), contentType: 'text' };
 }
 
-app.post('/jill', async (req, res) => {
+app.post('/jill', requireProductAuth, async (req, res) => {
   try {
     const { student, history, message, mode, weakKpis } = req.body || {};
 
@@ -442,7 +1018,7 @@ async function streamAnthropicSSE(res, { model, max_tokens, system, messages }) 
 }
 
 // ── JILL STREAM ──────────────────────────────────────────────
-app.post('/jill/stream', async (req, res) => {
+app.post('/jill/stream', requireProductAuth, async (req, res) => {
   try {
     const { student, history, message, weakKpis } = req.body || {};
     if (!message) return res.status(400).end();
@@ -464,10 +1040,12 @@ app.post('/jill/stream', async (req, res) => {
 });
 
 // ── ALICE STREAM ─────────────────────────────────────────────
-app.post('/alice/stream', async (req, res) => {
+app.post('/alice/stream', requireProductAuth, async (req, res) => {
   try {
     const { student, history, message, scenario, secret } = req.body || {};
-    if (ANALYZE_SECRET && secret !== ANALYZE_SECRET) return res.status(401).end();
+    if (req.auth.role === 'student' && !assertStudentScope(req, student?.id)) {
+      return res.status(403).json({ error: 'Student scope mismatch' });
+    }
     if (!message) return res.status(400).end();
     const tb = (student?.trainingBook || []).slice(0, 5)
       .map(ex => `- ${ex.title} (${ex.kpi || ''}): ${ex.studentTask || ''}`).join('\n');
@@ -525,23 +1103,35 @@ Siempre cerrar con agenda de evaluación gratuita o número de WhatsApp: +506 60
 app.post('/claire', async (req, res) => {
   try {
     const { history, message, mode, sessionId } = req.body || {};
+    const ip = getClientIp(req);
 
-    // START
     if (mode === 'start') {
-      const resp = await claudeCall({
-        model: 'claude-haiku-4-5-20251001', max_tokens: 150,
-        system: `Eres Claire, la asistente virtual de Off The Clock by Infinity. Eres cálida, paciente, inteligente y apasionada por ayudar a las personas a comunicarse mejor en inglés. Sabés exactamente qué dolor siente cada persona que llega.
-
-${CLAIRE_KB}
-
-REGLA DE IDIOMA: Iniciás en español. Si el cliente escribe en inglés, respondés en inglés.
-PERSONALIDAD: Como una amiga experta — no como un bot de ventas. Nunca presionés. Guiás con preguntas.`,
-        messages: [{ role:'user', content:'Inicia la conversación de forma cálida y breve. Tu nombre es CLAIRE (no Clara, no Claro). Presentate y preguntá en qué podés ayudar.' }]
-      });
-      return res.json({ reply: resp.content.filter(b=>b.type==='text').map(b=>b.text).join('') });
+      const ipLimit = await checkDemoIpLimit(ip, 'claire', { action: 'session' });
+      if (!ipLimit.ok) {
+        return res.json({
+          reply: 'Gracias por tu interés en Off The Clock. Alcanzaste el límite de conversaciones por hoy — escribinos al WhatsApp +506 6006 0981 o volvé mañana. 😊',
+          limitReached: true
+        });
+      }
+      const startBuffered = '¡Hola! Soy Claire de Off The Clock. Estoy acá para ayudarte a entender cómo desarrollamos comunicación operacional en inglés — no gramática de libro. ¿Qué te trae hoy?';
+      return res.json({ reply: startBuffered, buffered: true });
     }
 
-    // CHAT
+    const msgLimit = await checkDemoIpLimit(ip, 'claire', { action: 'message' });
+    if (!msgLimit.ok) {
+      return res.json({
+        reply: 'Llegamos al límite de mensajes por hoy desde esta conexión. Agendá tu evaluación gratuita por WhatsApp: +506 6006 0981',
+        limitReached: true
+      });
+    }
+
+    if (!message?.trim()) return res.status(400).json({ error: 'Missing message' });
+
+    // CHAT — cache key from last user message hash for repeated FAQ-style inputs
+    const cacheKey = 'claire:' + crypto.createHash('md5').update((message || '').toLowerCase().trim().slice(0, 120)).digest('hex');
+    if (demoResponseCache.has(cacheKey)) {
+      return res.json({ reply: demoResponseCache.get(cacheKey), buffered: true, cacheHit: true });
+    }
     const systemPrompt = `Eres Claire, asistente virtual de Off The Clock by Infinity. Cálida, paciente, experta, apasionada.
 
 ${CLAIRE_KB}
@@ -571,7 +1161,9 @@ COMPRENSIÓN: Leé bien lo que dice el cliente antes de responder. Respondé a L
       model: 'claude-sonnet-4-6', max_tokens: 150,
       system: systemPrompt, messages: msgs
     });
-    return res.json({ reply: resp.content.filter(b=>b.type==='text').map(b=>b.text).join('') });
+    const reply = resp.content.filter(b=>b.type==='text').map(b=>b.text).join('');
+    if (reply.length > 20) cacheDemoResponse(cacheKey, reply);
+    return res.json({ reply });
 
   } catch(err) {
     console.error('Claire error:', err.message);
@@ -580,7 +1172,7 @@ COMPRENSIÓN: Leé bien lo que dice el cliente antes de responder. Respondé a L
 });
 
 // ── ELEVENLABS TTS ───────────────────────────────────────────
-app.post('/claire-tts', async (req, res) => {
+app.post('/claire-tts', optionalAuth, async (req, res) => {
   try {
     const { text } = req.body || {};
     return await synthesizeSpeech(req, res, { text, voiceId: CLAIRE_VOICE_ID, label: 'Claire' });
@@ -590,7 +1182,7 @@ app.post('/claire-tts', async (req, res) => {
   }
 });
 
-app.post('/alice-tts', async (req, res) => {
+app.post('/alice-tts', requireProductAuth, async (req, res) => {
   try {
     const { text } = req.body || {};
     return await synthesizeSpeech(req, res, { text, voiceId: ALICE_VOICE_ID, label: 'Alice' });
@@ -600,7 +1192,7 @@ app.post('/alice-tts', async (req, res) => {
   }
 });
 
-app.post('/jill-tts', async (req, res) => {
+app.post('/jill-tts', requireProductAuth, async (req, res) => {
   try {
     const { text } = req.body || {};
     return await synthesizeSpeech(req, res, { text, voiceId: JILL_VOICE_ID, label: 'Jill' });
@@ -641,9 +1233,9 @@ app.get('/dashboard', async (req, res) => {
     // 1. ElevenLabs credits
     let elevenCredits = null;
     try {
-      const ELEVEN_KEY = process.env.ELEVENLABS_KEY || 'sk_e73d6b68b4ab1b670e1e2ea9ef562e165391d670d995c206';
+      const elevenKey = process.env.ELEVENLABS_KEY || '';
       const eRes = await fetch('https://api.elevenlabs.io/v1/user/subscription', {
-        headers: { 'xi-api-key': ELEVEN_KEY }
+        headers: { 'xi-api-key': elevenKey }
       });
       if(eRes.ok){
         const eData = await eRes.json();
@@ -724,7 +1316,7 @@ app.get('/dashboard', async (req, res) => {
 
 
 // ── NEXORA VOICE PROFILES ─────────────────────────────────────
-app.post('/nexora-tts', async (req, res) => {
+app.post('/nexora-tts', requireProductAuth, async (req, res) => {
   try {
     const { text, voiceId } = req.body || {};
     return await synthesizeSpeech(req, res, {
@@ -739,7 +1331,7 @@ app.post('/nexora-tts', async (req, res) => {
 });
 
 // ── NEXORA CALL SIMULATION ────────────────────────────────────
-app.post('/nexora', async (req, res) => {
+app.post('/nexora', requireProductAuth, async (req, res) => {
   try {
     const { message, history, profile, scenario, agentName } = req.body || {};
 
@@ -946,7 +1538,7 @@ CRITICAL RULES:
 });
 
 // ── NEXORA EVALUATION ─────────────────────────────────────────
-app.post('/nexora-eval', async (req, res) => {
+app.post('/nexora-eval', requireProductAuth, async (req, res) => {
   try {
     const { transcript, scenario, profile, agentName, talkTime, holdEvents, transferred } = req.body || {};
 
@@ -1051,6 +1643,13 @@ app.post('/webhook', async (req, res) => {
     console.error('Webhook error:', err.message);
     return res.sendStatus(500);
   }
+});
+
+app.use((err, req, res, next) => {
+  if (err && err.message === 'CORS not allowed') {
+    return res.status(403).json({ error: 'Origin not allowed' });
+  }
+  next(err);
 });
 
 app.listen(PORT, () => console.log(`Server on port ${PORT}`));
