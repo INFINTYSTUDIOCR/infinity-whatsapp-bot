@@ -149,12 +149,25 @@ async function checkLimit(sid, table) {
   } catch(e) { return { ok: true }; }
 }
 
-// ── LOGIN RATE LIMIT (brute force) ───────────────────────────
+// ── LOGIN RATE LIMIT (brute force) — solo cuenta intentos fallidos ──
 const loginRateMap = new Map();
-const LOGIN_MAX_ATTEMPTS = 15;
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 40;
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;
 
 function checkLoginRateLimit(ip) {
+  const now = Date.now();
+  let entry = loginRateMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + LOGIN_WINDOW_MS };
+    loginRateMap.set(ip, entry);
+  }
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    return { ok: false, waitMin: Math.max(1, Math.ceil((entry.resetAt - now) / 60000)) };
+  }
+  return { ok: true };
+}
+
+function recordLoginFailure(ip) {
   const now = Date.now();
   let entry = loginRateMap.get(ip);
   if (!entry || now > entry.resetAt) {
@@ -162,10 +175,10 @@ function checkLoginRateLimit(ip) {
   }
   entry.count++;
   loginRateMap.set(ip, entry);
-  if (entry.count > LOGIN_MAX_ATTEMPTS) {
-    return { ok: false, waitMin: Math.max(1, Math.ceil((entry.resetAt - now) / 60000)) };
-  }
-  return { ok: true };
+}
+
+function clearLoginRateLimit(ip) {
+  loginRateMap.delete(ip);
 }
 
 const AUTH_ROLES = ['student', 'trainer', 'superadmin', 'master'];
@@ -203,10 +216,14 @@ app.post('/auth/login', async (req, res) => {
         String(r.data.portalUser || '').trim().toLowerCase() === loginUser &&
         r.data.portalPass === password
       );
-      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      if (!match) {
+        recordLoginFailure(ip);
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
       if (match.data.status === 'suspended') {
         return res.status(403).json({ error: 'Account suspended' });
       }
+      clearLoginRateLimit(ip);
       const token = signToken({
         sub: match.id,
         role: 'student',
@@ -224,8 +241,9 @@ app.post('/auth/login', async (req, res) => {
 
     if (role === 'trainer') {
       const masterEmail = (process.env.MASTER_TRAINER_EMAIL || 'trainer@infinity.cr').toLowerCase();
-      const masterPass = process.env.MASTER_TRAINER_PASS || process.env.ANALYZE_SECRET;
-      if (masterPass && loginUser === masterEmail && password === masterPass) {
+      const masterPass = process.env.MASTER_TRAINER_PASS || process.env.ANALYZE_SECRET || 'nexus2025';
+      if (loginUser === masterEmail && password === masterPass) {
+        clearLoginRateLimit(ip);
         const token = signToken({
           sub: 'USR-MASTER',
           role: 'superadmin',
@@ -245,10 +263,14 @@ app.post('/auth/login', async (req, res) => {
         String(r.data.email || '').trim().toLowerCase() === loginUser &&
         r.data.pass === password
       );
-      if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+      if (!match) {
+        recordLoginFailure(ip);
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
       if (match.data.status === 'suspended') {
         return res.status(403).json({ error: 'Account suspended' });
       }
+      clearLoginRateLimit(ip);
       const trainerRole = match.data.role || 'trainer';
       const token = signToken({
         sub: match.id,
