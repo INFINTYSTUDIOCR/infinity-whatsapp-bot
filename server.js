@@ -67,11 +67,25 @@ async function claudeCall({ model, max_tokens, system, messages }) {
 }
 
 async function sbGet(table) {
-  const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,data`, {
-    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
-  });
-  if (!r.ok) return [];
-  return r.json();
+  if (!SUPABASE_URL || !SUPABASE_KEY) {
+    console.error('sbGet: SUPABASE_URL or SUPABASE_KEY not configured');
+    return [];
+  }
+  try {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}?select=id,data`, {
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      console.error(`sbGet ${table} failed: ${r.status} ${t.slice(0, 120)}`);
+      return [];
+    }
+    const data = await r.json();
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.error(`sbGet ${table} error:`, err.message);
+    return [];
+  }
 }
 
 async function sbSet(table, id, data) {
@@ -251,7 +265,7 @@ app.post('/auth/login', async (req, res) => {
     return res.status(400).json({ error: 'Invalid role' });
   } catch (err) {
     console.error('Login error:', err.message);
-    return res.status(500).json({ error: 'Login failed' });
+    return res.status(500).json({ error: 'Login failed', detail: err.message });
   }
 });
 
